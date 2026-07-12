@@ -6,6 +6,8 @@ import time
 from concurrent.futures import Executor, Future
 from types import SimpleNamespace
 
+import pytest
+
 
 class InlineExecutor(Executor):
     def submit(self, fn, /, *args, **kwargs):
@@ -26,6 +28,8 @@ class FakeClient:
         self.raw_requests = []
         self.correction_previews = []
         self.corrections = []
+        self.preview_allowed = True
+        self.preview_satisfied = False
         self.closed = False
 
     def auth_me(self):
@@ -73,13 +77,15 @@ class FakeClient:
     def preview_correction(self, source_id: str, request):
         self.correction_previews.append((source_id, request))
         return SimpleNamespace(
-            allowed=True,
+            allowed=self.preview_allowed,
+            intended_outcome_satisfied=self.preview_satisfied,
             source_id=source_id,
             action=request.action,
             target_lifecycle_state="active",
             current_revision=2,
             revision=2,
             policy_reasons=("project_scope_write_allowed",),
+            reason="allowed" if self.preview_allowed else "policy_denied",
         )
 
     def apply_correction(self, source_id: str, request, *, idempotency_key: str):
@@ -310,6 +316,52 @@ def test_correction_tool_previews_before_revision_guarded_apply(plugin_module, t
     assert len(client.corrections) == 1
     assert client.corrections[0][1].expected_revision == 2
     assert outbox.snapshot().total == 0
+
+
+@pytest.mark.parametrize(
+    ("allowed", "satisfied", "expected_action"),
+    [
+        (True, True, "obsolete"),
+        (False, False, "dead_letter"),
+        (True, False, "superseded"),
+    ],
+)
+def test_revision_reconciliation_uses_exact_server_outcome(
+    plugin_module,
+    tmp_path,
+    allowed: bool,
+    satisfied: bool,
+    expected_action: str,
+):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path)
+    outbox_module = importlib.import_module(f"{plugin_module.__name__}.outbox")
+    schemas = importlib.import_module(f"{plugin_module.__name__}.schemas")
+    runtime.initialize(context)
+    request = schemas.CorrectionRequest(
+        action="mark_stale",
+        reason="revision reconciliation",
+        expected_revision=1,
+        metadata={"provider_operation_id": "correction-1"},
+    )
+    outbox.enqueue(
+        outbox_module.NewOperation(
+            operation_id="correction-1",
+            kind="manual_correction",
+            endpoint="/api/memory/inspect/source-1/corrections",
+            request=request.to_json(),
+            idempotency_key="hermes-correction-correction-1",
+        )
+    )
+    claimed = outbox.claim_page("reconcile-test")[0]
+    client.preview_allowed = allowed
+    client.preview_satisfied = satisfied
+
+    result = runtime._reconcile_correction(claimed, "source-1", request)
+
+    assert result.action.value == expected_action
+    if expected_action == "superseded":
+        assert outbox.snapshot().total == 1
+        assert outbox.history_outcome("correction-1").value == "superseded"
 
 
 def test_branch_and_resume_preserve_original_parent_lineage(plugin_module, tmp_path):

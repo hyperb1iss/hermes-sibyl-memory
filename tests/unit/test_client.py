@@ -79,6 +79,7 @@ def _correction_response(
     return {
         "allowed": True,
         "applied": key is not None,
+        "intended_outcome_satisfied": False,
         "source_id": "abc",
         "action": action,
         "reason": "allowed",

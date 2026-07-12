@@ -745,10 +745,14 @@ class SibylRuntime:
         request: CorrectionRequest,
     ) -> AttemptResult:
         preview = self._client.preview_correction(source_id, request)
-        if preview.target_lifecycle_state == "erased" or (
-            request.action == "mark_stale" and preview.target_lifecycle_state == "stale"
-        ):
+        if preview.target_lifecycle_state == "erased" or preview.intended_outcome_satisfied:
             return AttemptResult.failure(ResultAction.OBSOLETE, status=200)
+        if not preview.allowed:
+            return AttemptResult.failure(
+                ResultAction.DEAD_LETTER,
+                status=200,
+                error="correction preview denied during revision reconciliation",
+            )
         current_revision = preview.current_revision or preview.revision
         if current_revision is None:
             return AttemptResult.failure(

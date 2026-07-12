@@ -477,6 +477,7 @@ class RawMemoryResponse:
 class CorrectionResponse:
     allowed: bool
     applied: bool
+    intended_outcome_satisfied: bool
     source_id: str
     action: str
     reason: str
@@ -505,6 +506,11 @@ class CorrectionResponse:
         return cls(
             allowed=_required_bool(data, "allowed", "response"),
             applied=_required_bool(data, "applied", "response"),
+            intended_outcome_satisfied=_required_bool(
+                data,
+                "intended_outcome_satisfied",
+                "response",
+            ),
             source_id=_required_string(data, "source_id", "response"),
             action=_required_string(data, "action", "response"),
             reason=_required_string(data, "reason", "response"),
