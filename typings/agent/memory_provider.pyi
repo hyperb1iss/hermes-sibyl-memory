@@ -1,0 +1,13 @@
+from abc import ABC, abstractmethod
+from typing import Any
+
+class MemoryProvider(ABC):
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+    @abstractmethod
+    def is_available(self) -> bool: ...
+    @abstractmethod
+    def initialize(self, session_id: str, **kwargs: Any) -> None: ...
+    @abstractmethod
+    def get_tool_schemas(self) -> list[dict[str, Any]]: ...

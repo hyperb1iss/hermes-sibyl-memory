@@ -1,0 +1,3 @@
+from typing import Any
+
+def save_config(config: dict[str, Any]) -> None: ...

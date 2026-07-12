@@ -1,0 +1,60 @@
+[project]
+name = "hermes-sibyl-memory"
+version = "0.1.0"
+description = "Sibyl memory provider for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "MIT"
+dependencies = ["httpx==0.28.1"]
+
+[dependency-groups]
+dev = [
+  "pytest==9.0.2",
+  "pyyaml==6.0.3",
+  "ruff==0.15.12",
+  "ty==0.0.34",
+]
+contract = [
+  "hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@9de9c25f620ff7f1ce0fd5457d596052d5159596",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "contract: runs against the pinned Hermes Agent 0.18.2 runtime",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+required-version = "==0.15.12"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "S", "SIM", "TC", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["N999"]
+"tests/**" = ["S101"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ty.environment]
+python-version = "3.11"
+root = ["."]
+extra-paths = ["typings"]
+
+[tool.ty.src]
+include = ["*.py", "tests/**/*.py"]
+exclude = [".venv/**", "tests/contract/**"]
+
+[tool.ty.rules]
+# Hermes requires a flat plugin root whose repository directory contains a
+# hyphen. ty cannot currently resolve relative imports for that layout, while
+# the pinned Hermes contract test exercises the real synthetic-package loader.
+unresolved-import = "ignore"

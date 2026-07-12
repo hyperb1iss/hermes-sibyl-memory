@@ -1,0 +1,8 @@
+manifest_version: 1
+name: sibyl
+version: 0.1.0
+description: "Governed, source-preserving memory for Hermes through Sibyl."
+kind: exclusive
+pip_dependencies:
+  - "httpx==0.28.1"
+requires_env: []

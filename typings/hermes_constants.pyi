@@ -1,0 +1,3 @@
+from pathlib import Path
+
+def get_hermes_home() -> Path: ...
