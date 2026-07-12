@@ -5,6 +5,7 @@ from capture import (
     canonical_request_hash,
     canonical_source,
     committed_turn_fingerprints,
+    committed_turns,
     derive_turn_identity,
 )
 
@@ -102,13 +103,13 @@ def test_capture_contains_only_explicit_final_turn_content():
 
 
 def test_reconciliation_fingerprints_ignore_tool_content():
-    fingerprints = committed_turn_fingerprints(
-        [
-            {"role": "user", "content": "question"},
-            {"role": "assistant", "content": None, "tool_calls": [{"name": "secret"}]},
-            {"role": "tool", "content": "TOOL CANARY"},
-            {"role": "assistant", "content": "final"},
-        ]
-    )
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": None, "tool_calls": [{"name": "secret"}]},
+        {"role": "tool", "content": "TOOL CANARY"},
+        {"role": "assistant", "content": "final"},
+    ]
+    fingerprints = committed_turn_fingerprints(messages)
 
     assert len(fingerprints) == 1
+    assert committed_turns(messages) == [("question", "final")]

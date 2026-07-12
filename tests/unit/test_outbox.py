@@ -271,6 +271,20 @@ def test_revision_reconcile_can_atomically_supersede_with_new_intent(tmp_path: P
     assert outbox.claim_page("worker")[0].operation_id == "new"
 
 
+def test_superseded_result_needs_no_second_claim_mutation(tmp_path: Path) -> None:
+    outbox = DurableOutbox(tmp_path)
+    outbox.enqueue(operation("old", endpoint="/api/memory/inspect/source/corrections"))
+    old = outbox.claim_page("worker")[0]
+    outbox.supersede(
+        old,
+        operation("new", endpoint="/api/memory/inspect/source/corrections"),
+    )
+
+    outbox.apply_result(old, AttemptResult.failure(ResultAction.SUPERSEDED))
+
+    assert outbox.history_outcome("old") is Outcome.SUPERSEDED
+
+
 def test_snapshot_reports_backlog_age_claims_and_dependencies(tmp_path: Path) -> None:
     outbox = DurableOutbox(tmp_path)
     outbox.enqueue(operation("source"))

@@ -36,6 +36,7 @@ def canonical_request_hash(payload: dict[str, Any]) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     ).encode("utf-8")
     return _sha256(encoded)
 
@@ -176,8 +177,8 @@ def build_turn_capture(
     return TurnCapture(identity=identity, payload=payload)
 
 
-def committed_turn_fingerprints(messages: list[dict[str, Any]]) -> list[str]:
-    fingerprints: list[str] = []
+def committed_turns(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
     pending_user: str | None = None
     for message in messages:
         role = message.get("role")
@@ -189,9 +190,13 @@ def committed_turn_fingerprints(messages: list[dict[str, Any]]) -> list[str]:
             continue
         if message.get("tool_calls"):
             continue
-        fingerprints.append(turn_hash(pending_user, content))
+        turns.append((pending_user, content))
         pending_user = None
-    return fingerprints
+    return turns
+
+
+def committed_turn_fingerprints(messages: list[dict[str, Any]]) -> list[str]:
+    return [turn_hash(user, assistant) for user, assistant in committed_turns(messages)]
 
 
 __all__ = [
@@ -204,6 +209,7 @@ __all__ = [
     "canonical_request_hash",
     "canonical_source",
     "committed_turn_fingerprints",
+    "committed_turns",
     "derive_turn_identity",
     "message_hash",
     "turn_hash",

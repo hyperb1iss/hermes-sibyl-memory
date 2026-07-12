@@ -76,6 +76,7 @@ class ResultAction(StrEnum):
     RECOVER = "recover"
     RECONCILE_REVISION = "reconcile_revision"
     OBSOLETE = "obsolete"
+    SUPERSEDED = "superseded"
 
 
 class OutboxError(RuntimeError):
@@ -808,6 +809,8 @@ class DurableOutbox:
         return expires_at
 
     def apply_result(self, operation: ClaimedOperation, result: AttemptResult) -> None:
+        if result.action is ResultAction.SUPERSEDED:
+            return
         if result.action is ResultAction.SUCCEED:
             outcome = Outcome.REPLAYED if result.replayed else Outcome.SUCCEEDED
             self._archive_and_delete(operation, outcome=outcome, result=result)
