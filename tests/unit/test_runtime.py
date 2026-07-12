@@ -254,3 +254,68 @@ def test_correction_tool_previews_before_revision_guarded_apply(plugin_module, t
     assert len(client.corrections) == 1
     assert client.corrections[0][1].expected_revision == 2
     assert outbox.snapshot().total == 0
+
+
+def test_branch_and_resume_preserve_original_parent_lineage(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+    runtime.on_session_switch("child", parent_session_id="session-1")
+    runtime.on_turn_start(1, "child one")
+    runtime.sync_turn("child one", "answer one")
+    runtime.on_session_switch("other", reset=True)
+    runtime.on_session_switch("child", parent_session_id="other")
+    runtime.on_turn_start(2, "child two")
+    runtime.sync_turn("child two", "answer two")
+
+    assert client.raw_requests[-2][0].metadata["parent_session_id"] == "session-1"
+    assert client.raw_requests[-1][0].metadata["parent_session_id"] == "session-1"
+    assert [turn.local_sequence for turn in outbox.indexed_turns("child")] == [1, 2]
+
+
+def test_rewind_queues_stale_correction_before_new_turn(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+    runtime.on_turn_start(1, "discarded")
+    runtime.sync_turn("discarded", "old answer")
+    old_source_id = client.raw_requests[-1][0].source_id
+    runtime.on_session_switch("session-1", rewound=True)
+    runtime.on_turn_start(2, "replacement")
+
+    runtime.sync_turn(
+        "replacement",
+        "new answer",
+        messages=[
+            {"role": "user", "content": "replacement"},
+            {"role": "assistant", "content": "new answer"},
+        ],
+    )
+
+    source_id, correction, _ = client.corrections[0]
+    assert source_id == old_source_id
+    assert correction.action == "mark_stale"
+    assert correction.reason == "hermes_session_rewind"
+    assert correction.expected_revision == 1
+    assert outbox.session_reconcile_required("session-1") is False
+
+
+def test_resume_reconciliation_recovers_pre_outbox_completed_turn(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+    runtime.on_turn_start(2, "current")
+
+    runtime.sync_turn(
+        "current",
+        "current answer",
+        messages=[
+            {"role": "user", "content": "lost before outbox"},
+            {"role": "assistant", "content": "recovered answer"},
+            {"role": "user", "content": "current"},
+            {"role": "assistant", "content": "current answer"},
+        ],
+    )
+
+    assert [request.raw_content for request, _ in client.raw_requests] == [
+        "[User]\nlost before outbox\n\n[Assistant]\nrecovered answer",
+        "[User]\ncurrent\n\n[Assistant]\ncurrent answer",
+    ]
+    assert [turn.local_sequence for turn in outbox.indexed_turns("session-1")] == [1, 2]

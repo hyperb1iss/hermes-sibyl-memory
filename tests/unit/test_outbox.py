@@ -365,6 +365,7 @@ def test_session_sequences_and_turn_index_survive_reopen(tmp_path: Path) -> None
     assert indexed[0].local_sequence == 1
     assert reopened.reserve_sequence("session-1") == 3
     assert reopened.session_reconcile_required("session-1") is True
+    assert reopened.session_parent_id("session-1") == "parent-1"
 
 
 def test_turn_index_reports_queued_state_and_revision(tmp_path: Path) -> None:

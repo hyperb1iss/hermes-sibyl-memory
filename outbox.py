@@ -611,6 +611,14 @@ class DurableOutbox:
             ).fetchone()
         return bool(row and row["reconcile_required"])
 
+    def session_parent_id(self, session_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT parent_session_id FROM session_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return str(row["parent_session_id"]) if row is not None else None
+
     def indexed_turns(self, session_id: str) -> list[IndexedTurnRecord]:
         with self._connect() as connection:
             rows = connection.execute(

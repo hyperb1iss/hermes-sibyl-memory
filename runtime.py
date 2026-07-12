@@ -182,11 +182,14 @@ class SibylRuntime:
         if reset:
             self._turns.clear(old_session)
             self._recall.discard_session(old_session)
+        existing_parent = self._outbox.session_parent_id(new_session_id)
         self._session_id = new_session_id
-        self._parent_session_id = parent_session_id
+        self._parent_session_id = (
+            existing_parent if existing_parent is not None else ("" if reset else parent_session_id)
+        )
         self._outbox.mark_session_reconcile(
             new_session_id,
-            parent_session_id=parent_session_id,
+            parent_session_id=self._parent_session_id,
             required=True,
         )
         if rewound:
