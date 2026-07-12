@@ -507,16 +507,17 @@ class SibylRuntime:
         *,
         turn_number: int | None,
     ) -> str:
+        parent_session_id = self._outbox.session_parent_id(session_id) or ""
         local_sequence = self._outbox.reserve_sequence(
             session_id,
-            parent_session_id=self._parent_session_id,
+            parent_session_id=parent_session_id,
         )
         capture = build_turn_capture(
             agent_id=self._context.agent_id,
             agent_workspace=self._context.agent_workspace,
             agent_identity=self._context.agent_identity,
             session_id=session_id,
-            parent_session_id=self._parent_session_id,
+            parent_session_id=parent_session_id,
             local_sequence=local_sequence,
             turn_number=turn_number,
             user_content=user_content,

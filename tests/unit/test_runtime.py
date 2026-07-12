@@ -319,3 +319,19 @@ def test_resume_reconciliation_recovers_pre_outbox_completed_turn(plugin_module,
         "[User]\ncurrent\n\n[Assistant]\ncurrent answer",
     ]
     assert [turn.local_sequence for turn in outbox.indexed_turns("session-1")] == [1, 2]
+
+
+def test_late_old_session_sync_uses_its_persisted_lineage(plugin_module, tmp_path):
+    runtime, context, client, _outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+    runtime.on_turn_start(1, "old session turn")
+    runtime.on_session_switch("child", parent_session_id="session-1")
+
+    runtime.sync_turn(
+        "old session turn",
+        "late answer",
+        session_id="session-1",
+    )
+
+    assert client.raw_requests[-1][0].metadata["session_id"] == "session-1"
+    assert client.raw_requests[-1][0].metadata["parent_session_id"] == ""
