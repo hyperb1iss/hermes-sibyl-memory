@@ -30,6 +30,7 @@ def _result(markdown: str = "# Memory") -> RecallResult:
         rendered_item_ids=("decision_1",),
         total_items=1,
         request_id="request-1",
+        rendered_token_estimate=42,
     )
 
 
@@ -46,6 +47,21 @@ def test_current_query_returns_markdown_and_records_exact_delivery():
 
     assert markdown == "session-1:current"
     assert deliveries[0][2].rendered_item_ids == ("decision_1",)
+
+
+def test_ready_observation_captures_response_accounting():
+    observations = []
+    coordinator = RecallCoordinator(
+        lambda query, session: _result(),
+        lambda *values: None,
+        executor=ImmediateExecutor(),
+        observe=observations.append,
+    )
+    coordinator.schedule("current", session_id="session-1")
+
+    assert coordinator.prefetch("current", session_id="session-1")
+    assert observations[-1].request_id == "request-1"
+    assert observations[-1].rendered_token_estimate == 42
 
 
 def test_different_query_never_receives_cached_context():

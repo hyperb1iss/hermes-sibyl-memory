@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 CONFIG_FILE = "sibyl.json"
+RUNTIME_IDENTITY_FILE = "state/sibyl-runtime-identity.json"
 API_KEY_ENV = "SIBYL_API_KEY"
 DEFAULT_BASE_URL = "http://127.0.0.1:3334/api"
 
@@ -138,6 +139,35 @@ def resolve_hermes_home(hermes_home: str | Path | None = None) -> Path:
 
 def config_path(hermes_home: str | Path | None = None) -> Path:
     return resolve_hermes_home(hermes_home) / CONFIG_FILE
+
+
+def runtime_identity_path(hermes_home: str | Path | None = None) -> Path:
+    return resolve_hermes_home(hermes_home) / RUNTIME_IDENTITY_FILE
+
+
+def load_runtime_agent_id(hermes_home: str | Path | None = None) -> str | None:
+    path = runtime_identity_path(hermes_home)
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    agent_id = data.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id.strip():
+        raise ValueError(f"{path} has no valid agent_id")
+    return agent_id
+
+
+def save_runtime_agent_id(
+    agent_id: str,
+    hermes_home: str | Path | None = None,
+) -> None:
+    if not agent_id or len(agent_id.split(":")) != 3:
+        raise ValueError("agent_id must use hermes:<workspace>:<identity>")
+    _atomic_write(
+        runtime_identity_path(hermes_home),
+        json.dumps({"agent_id": agent_id}, sort_keys=True) + "\n",
+    )
 
 
 def load_provider_config(hermes_home: str | Path | None = None) -> ProviderConfig:
@@ -306,6 +336,12 @@ def run_setup(hermes_home: str, hermes_config: dict[str, Any]) -> None:
     if not config.is_complete:
         raise ValueError("project_id and memory_space_id are required")
 
+    _validate_setup_credential(
+        config,
+        api_key,
+        agent_id=load_runtime_agent_id(home) or _active_runtime_agent_id(),
+    )
+
     save_provider_config(config, home)
     if api_key != existing_key:
         save_api_key(api_key, home)
@@ -319,3 +355,36 @@ def run_setup(hermes_home: str, hermes_config: dict[str, Any]) -> None:
 
     print("\n  Memory provider: sibyl")
     print("  Configuration saved; start a new session to activate.\n")
+
+
+def _active_runtime_agent_id() -> str:
+    from hermes_cli.profiles import get_active_profile_name
+
+    profile = get_active_profile_name().strip()
+    if not profile or ":" in profile:
+        raise ValueError("Hermes active profile cannot form a canonical agent identity")
+    return f"hermes:hermes:{profile}"
+
+
+def _validate_setup_credential(
+    config: ProviderConfig,
+    api_key: str,
+    *,
+    agent_id: str | None,
+) -> None:
+    from .client import SibylClient
+    from .trust import CredentialRequirement, validate_credential
+
+    client = SibylClient(base_url=config.base_url, api_key=api_key)
+    try:
+        response = client.auth_me()
+        validate_credential(
+            response.credential,
+            CredentialRequirement(
+                project_id=config.project_id,
+                memory_space_id=config.memory_space_id,
+                agent_id=agent_id,
+            ),
+        )
+    finally:
+        client.close()

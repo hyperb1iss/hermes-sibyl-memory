@@ -14,11 +14,18 @@ from urllib.parse import urlsplit
 
 from .capture import build_turn_capture
 from .client import SibylClient, SibylClientError
-from .config import config_path, load_api_key, load_provider_config, resolve_hermes_home
+from .config import (
+    config_path,
+    load_api_key,
+    load_provider_config,
+    load_runtime_agent_id,
+    resolve_hermes_home,
+)
 from .outbox import DurableOutbox, FlushReport, OutboxSnapshot
 from .provider import RuntimeContext
 from .runtime import ADAPTER_VERSION, HERMES_VERSION, SibylRuntime
 from .schemas import AuthMeResponse, ContextPackRequest, CorrectionRequest, RawMemoryRequest
+from .trust import CredentialRequirement, credential_failures
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
@@ -92,11 +99,12 @@ def _active_profile_name() -> str:
 
 def _operator_context() -> _OperatorContext:
     home = resolve_hermes_home()
+    runtime_agent_id = load_runtime_agent_id(home)
     return _OperatorContext(
         home=home,
         config=load_provider_config(home),
         api_key=load_api_key(home),
-        agent_id=f"hermes:hermes:{_active_profile_name()}",
+        agent_id=runtime_agent_id or f"hermes:hermes:{_active_profile_name()}",
     )
 
 
@@ -206,6 +214,14 @@ def _status() -> None:
 
 def _credential_checks(response: AuthMeResponse, context: _OperatorContext) -> list[_Check]:
     credential = response.credential
+    shared_failures = credential_failures(
+        credential,
+        CredentialRequirement(
+            project_id=context.config.project_id,
+            memory_space_id=context.config.memory_space_id,
+            agent_id=context.agent_id,
+        ),
+    )
     checks = [
         _Check(
             "authentication",
@@ -252,6 +268,13 @@ def _credential_checks(response: AuthMeResponse, context: _OperatorContext) -> l
             "memory_provider is active"
             if credential.capability_profile == "memory_provider"
             else "set capability_profile=memory_provider",
+        ),
+        _Check(
+            "least-privilege contract",
+            "pass" if not shared_failures else "fail",
+            "credential matches the provider trust boundary"
+            if not shared_failures
+            else "; ".join(shared_failures),
         ),
     ]
     return checks

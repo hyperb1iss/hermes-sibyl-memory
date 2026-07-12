@@ -86,3 +86,27 @@ def test_provider_delegates_through_frozen_runtime_seam(tmp_path, plugin_module)
     assert "untrusted evidence" in provider.system_prompt_block()
     provider.shutdown()
     assert runtime.closed is True
+
+
+def test_reinitialize_closes_previous_runtime(tmp_path, plugin_module):
+    provider_module = __import__(f"{plugin_module.__name__}.provider", fromlist=["provider"])
+    save_provider_config(
+        ProviderConfig.from_mapping(
+            {
+                "base_url": "https://sibyl.example/api",
+                "project_id": "project_test",
+                "memory_space_id": "space_test",
+            }
+        ),
+        tmp_path,
+    )
+    save_api_key("secret-value", tmp_path)
+    runtimes = [RecordingRuntime(), RecordingRuntime()]
+    provider = provider_module.SibylMemoryProvider(runtime_factory=lambda context: runtimes.pop(0))
+
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+    first = provider._runtime
+    provider.initialize("session-2", hermes_home=str(tmp_path))
+
+    assert first.closed is True
+    assert provider._runtime.context.session_id == "session-2"

@@ -15,13 +15,22 @@ def test_completed_turn_consumes_matching_fifo_entry():
     assert queue.consume("session-1", "second").turn_number == 5
 
 
-def test_mismatch_is_explicit_and_does_not_reassign_newest_turn():
+def test_interrupted_older_turn_is_discarded_when_newer_completed_turn_matches():
     queue = TurnStartQueue()
     queue.record("session-1", 4, "first")
     queue.record("session-1", 5, "second")
 
-    with pytest.raises(TurnReconciliationError, match="oldest turn-start"):
-        queue.consume("session-1", "second")
+    assert queue.consume("session-1", "second").turn_number == 5
+    with pytest.raises(TurnReconciliationError, match="no turn-start"):
+        queue.consume("session-1", "first")
+
+
+def test_unknown_mismatch_is_explicit_and_retains_queue():
+    queue = TurnStartQueue()
+    queue.record("session-1", 4, "first")
+
+    with pytest.raises(TurnReconciliationError, match="any queued"):
+        queue.consume("session-1", "unknown")
 
     assert queue.consume("session-1", "first").turn_number == 4
 

@@ -146,7 +146,7 @@ class CorrectionToolArgs:
     @classmethod
     def parse(cls, args: dict[str, Any]) -> CorrectionToolArgs:
         source_id = _required_string(args, "source_id", maximum=1_000)
-        reason = _required_string(args, "reason", maximum=10_000)
+        reason = _required_string(args, "reason", maximum=2_000)
         action = args.get("action")
         if action not in CORRECTION_ACTIONS:
             raise ToolValidationError("action is unsupported")
@@ -154,12 +154,12 @@ class CorrectionToolArgs:
         replacement_source_id = _optional_string(
             args,
             "replacement_source_id",
-            maximum=1_000,
+            maximum=500,
         )
         duplicate_of_source_id = _optional_string(
             args,
             "duplicate_of_source_id",
-            maximum=1_000,
+            maximum=500,
         )
         apply_value = args.get("apply", False)
         if not isinstance(apply_value, bool):
@@ -226,10 +226,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "source_id": {"type": "string", "maxLength": 1000},
                 "action": {"type": "string", "enum": sorted(CORRECTION_ACTIONS)},
-                "reason": {"type": "string", "maxLength": 10000},
+                "reason": {"type": "string", "maxLength": 2000},
                 "revised_content": {"type": "string", "maxLength": 500000},
-                "replacement_source_id": {"type": "string", "maxLength": 1000},
-                "duplicate_of_source_id": {"type": "string", "maxLength": 1000},
+                "replacement_source_id": {"type": "string", "maxLength": 500},
+                "duplicate_of_source_id": {"type": "string", "maxLength": 500},
                 "apply": {"type": "boolean", "default": False},
             },
             "required": ["source_id", "action", "reason"],

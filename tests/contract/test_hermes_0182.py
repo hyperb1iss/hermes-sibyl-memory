@@ -23,6 +23,7 @@ RUNTIME_FILES = [
     "schemas.py",
     "sessions.py",
     "provider_tools.py",
+    "trust.py",
 ]
 
 pytestmark = pytest.mark.contract
@@ -69,6 +70,8 @@ def test_real_0182_flat_discovery_and_direct_setup(tmp_path, monkeypatch, capsys
     assert provider is not None
     assert provider.name == "sibyl"
     assert provider.get_tool_schemas() == []
+    plugin_config = sys.modules["_hermes_user_memory.sibyl.config"]
+    monkeypatch.setattr(plugin_config, "_validate_setup_credential", lambda *args, **kwargs: None)
 
     memory_setup.cmd_setup_provider("sibyl")
 
@@ -169,3 +172,27 @@ def test_real_0182_memory_manager_routes_lifecycle_and_tools(tmp_path, monkeypat
     assert events[2] == ("prefetch", "current", "session-1")
     assert events[3][0] == "sync"
     assert events[-1] == ("shutdown",)
+
+
+def test_real_0182_skill_scaffolding_normalizes_to_user_instruction(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _install_flat_plugin(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _clear_loaded_plugin()
+
+    from plugins import memory
+
+    assert memory.load_memory_provider("sibyl") is not None
+
+    runtime = __import__(
+        "_hermes_user_memory.sibyl.runtime",
+        fromlist=["normalize_hermes_user_message"],
+    )
+    expanded = (
+        "[IMPORTANT: The user has invoked the example skill. "
+        "The full skill content is loaded below.]\nsecret scaffolding\n"
+        "The user has provided the following instruction alongside the skill invocation: "
+        "remember only this request\n\n[Runtime note: hidden]"
+    )
+
+    assert runtime.normalize_hermes_user_message(expanded) == "remember only this request"

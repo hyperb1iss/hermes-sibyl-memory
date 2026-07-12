@@ -17,6 +17,7 @@ from .config import (
     resolve_hermes_home,
     run_setup,
     save_provider_config,
+    save_runtime_agent_id,
 )
 
 _SYSTEM_PROMPT = (
@@ -178,6 +179,10 @@ class SibylMemoryProvider(MemoryProvider):
             agent_id=f"hermes:{agent_workspace}:{agent_identity}",
             kwargs=dict(kwargs),
         )
+        previous_runtime = self._runtime
+        self._configured = False
+        previous_runtime.shutdown()
+        save_runtime_agent_id(context.agent_id, hermes_home)
         self._runtime = self._runtime_factory(context)
         self._runtime.initialize(context)
         self._configured = True

@@ -113,3 +113,24 @@ def test_reconciliation_fingerprints_ignore_tool_content():
 
     assert len(fingerprints) == 1
     assert committed_turns(messages) == [("question", "final")]
+
+
+def test_reconciliation_flattens_visible_multimodal_text():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look here"},
+                {"type": "image_url", "image_url": {"url": "secret"}},
+            ],
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "visible answer"},
+                {"type": "input_image", "image_url": "secret"},
+            ],
+        },
+    ]
+
+    assert committed_turns(messages) == [("look here", "visible answer")]

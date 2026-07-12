@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import threading
+import time
 from concurrent.futures import Executor, Future
 from types import SimpleNamespace
 
@@ -53,6 +55,8 @@ class FakeClient:
             rendered_item_ids=("decision_1",),
             total_items=1,
             usage_hint="Use relevant evidence only.",
+            usage_metadata={"estimated_tokens": 12},
+            request_id="request-context-1",
         )
 
     def expose_context(self, request, *, idempotency_key: str):
@@ -86,7 +90,13 @@ class FakeClient:
         self.closed = True
 
 
-def _runtime_parts(plugin_module, tmp_path, *, offline: bool = False):
+def _runtime_parts(
+    plugin_module,
+    tmp_path,
+    *,
+    offline: bool = False,
+    shutdown_timeout_seconds: float = 4.0,
+):
     package = plugin_module.__name__
     config_module = importlib.import_module(f"{package}.config")
     provider_module = importlib.import_module(f"{package}.provider")
@@ -119,6 +129,7 @@ def _runtime_parts(plugin_module, tmp_path, *, offline: bool = False):
         client=client,
         outbox=outbox,
         executor=InlineExecutor(),
+        shutdown_timeout_seconds=shutdown_timeout_seconds,
     )
     return runtime, context, client, outbox
 
@@ -134,7 +145,23 @@ def test_recall_is_current_query_only_and_acknowledges_exact_ids(plugin_module, 
     assert client.context_requests[0].record_exposure is False
     assert client.context_requests[0].project == "project_home"
     assert client.exposures[0][0].exposed_ids == ("decision_1",)
+    assert set(client.exposures[0][0].to_json()["metadata"]) == {
+        "automatic",
+        "query_hash",
+        "session_id_hash",
+    }
     assert outbox.snapshot().total == 0
+
+
+def test_identical_context_on_two_turns_records_two_deliveries(plugin_module, tmp_path):
+    runtime, context, client, _outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+    for turn_number in (1, 2):
+        runtime.on_turn_start(turn_number, "same query")
+        assert runtime.prefetch("same query")
+
+    assert len(client.exposures) == 2
+    assert client.exposures[0][1] != client.exposures[1][1]
 
 
 def test_completed_turn_preserves_only_explicit_user_and_final_assistant(plugin_module, tmp_path):
@@ -160,6 +187,26 @@ def test_completed_turn_preserves_only_explicit_user_and_final_assistant(plugin_
     assert request.metadata["agent_id"] == "hermes:home:nova"
     assert idempotency_key.startswith("hermes-turn-")
     assert outbox.snapshot().total == 0
+
+
+def test_skill_wrapper_is_removed_from_turn_matching_and_capture(plugin_module, tmp_path):
+    runtime, context, client, _outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+    expanded = (
+        "[IMPORTANT: The user has invoked the example skill. "
+        "The full skill content is loaded below.]\nsecret scaffolding\n"
+        "The user has provided the following instruction alongside the skill invocation: "
+        "remember only this request\n\n[Runtime note: hidden]"
+    )
+
+    runtime.on_turn_start(1, expanded)
+    runtime.sync_turn(expanded, "captured answer")
+
+    request, _ = client.raw_requests[-1]
+    assert request.raw_content == (
+        "[User]\nremember only this request\n\n[Assistant]\ncaptured answer"
+    )
+    assert "secret scaffolding" not in request.raw_content
 
 
 def test_offline_sibyl_keeps_completed_turn_durable(plugin_module, tmp_path):
@@ -228,6 +275,7 @@ def test_manual_tools_keep_scope_fixed_and_write_through_outbox(plugin_module, t
     )
 
     assert "# Recalled" in recall
+    assert client.exposures[-1][0].automatic is False
     assert '"queued":true' in remembered
     assert client.raw_requests[-1][0].project_id == "project_home"
     assert client.raw_requests[-1][0].metadata["remember_kind"] == "decision"
@@ -319,6 +367,69 @@ def test_resume_reconciliation_recovers_pre_outbox_completed_turn(plugin_module,
         "[User]\ncurrent\n\n[Assistant]\ncurrent answer",
     ]
     assert [turn.local_sequence for turn in outbox.indexed_turns("session-1")] == [1, 2]
+
+
+def test_offline_rewind_hydrates_correction_from_source_receipt(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path, offline=True)
+    runtime.initialize(context)
+    runtime.on_turn_start(1, "discarded")
+    runtime.sync_turn("discarded", "old answer")
+    runtime.on_session_switch("session-1", rewound=True)
+    runtime.on_turn_start(2, "replacement")
+    runtime.sync_turn(
+        "replacement",
+        "new answer",
+        messages=[
+            {"role": "user", "content": "replacement"},
+            {"role": "assistant", "content": "new answer"},
+        ],
+    )
+    assert outbox.snapshot().total == 3
+
+    client.offline = False
+    runtime._validate_and_flush()
+
+    assert outbox.snapshot().total == 0
+    assert client.corrections[0][1].expected_revision == 1
+
+
+def test_shutdown_returns_within_hard_budget_while_http_is_blocked(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(
+        plugin_module,
+        tmp_path,
+        shutdown_timeout_seconds=0.02,
+    )
+    runtime.initialize(context)
+    runtime.on_turn_start(1, "durable")
+    client.offline = True
+    runtime._credential_safe = None
+    runtime.sync_turn("durable", "answer")
+    assert outbox.snapshot().total == 1
+    client.offline = False
+    entered = threading.Event()
+    release = threading.Event()
+    original_remember = client.remember_raw
+
+    def blocked_remember(request, *, idempotency_key):
+        entered.set()
+        release.wait(1)
+        return original_remember(request, idempotency_key=idempotency_key)
+
+    client.remember_raw = blocked_remember
+    runtime._credential_safe = True
+
+    started = time.monotonic()
+    runtime.shutdown()
+    elapsed = time.monotonic() - started
+
+    assert entered.is_set()
+    assert elapsed < 0.2
+    assert client.closed is False
+    release.set()
+    deadline = time.monotonic() + 1
+    while not client.closed and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert client.closed is True
 
 
 def test_late_old_session_sync_uses_its_persisted_lineage(plugin_module, tmp_path):

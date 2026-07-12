@@ -118,6 +118,13 @@ class IndexedTurnRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class NewTurnOperation:
+    operation: NewOperation
+    source_id: str
+    turn_hash: str
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimedOperation:
     operation_id: str
     depends_on_operation_id: str | None
@@ -522,6 +529,109 @@ class DurableOutbox:
             connection.commit()
         return sequence
 
+    def enqueue_turn(
+        self,
+        session_id: str,
+        factory: Callable[[int], NewTurnOperation],
+        *,
+        parent_session_id: str = "",
+    ) -> IndexedTurnRecord:
+        if not session_id:
+            raise ValueError("session_id is required")
+        now = _timestamp()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO session_state (
+                    session_id, parent_session_id, next_sequence,
+                    reconcile_required, updated_at
+                ) VALUES (?, ?, 1, 1, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    parent_session_id = CASE
+                        WHEN excluded.parent_session_id != ''
+                        THEN excluded.parent_session_id
+                        ELSE session_state.parent_session_id
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, parent_session_id, now),
+            )
+            local_sequence = int(
+                connection.execute(
+                    "SELECT next_sequence FROM session_state WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            turn = factory(local_sequence)
+            operation = turn.operation
+            self._validate_operation(operation)
+            if not turn.source_id or not turn.turn_hash:
+                raise ValueError("turn source_id and turn_hash are required")
+            request_json = _canonical_request(operation.request)
+            request_hash = hashlib.sha256(request_json.encode()).hexdigest()
+            collision = connection.execute(
+                """
+                SELECT operation_id FROM operations WHERE operation_id = ?
+                UNION ALL
+                SELECT operation_id FROM operation_history WHERE operation_id = ?
+                LIMIT 1
+                """,
+                (operation.operation_id, operation.operation_id),
+            ).fetchone()
+            if collision is not None:
+                raise OperationConflictError(f"operation {operation.operation_id} already exists")
+            connection.execute(
+                """
+                INSERT INTO operations (
+                    operation_id, depends_on_operation_id, kind, endpoint,
+                    request_json, request_hash, idempotency_key, http_method,
+                    state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    operation.operation_id,
+                    operation.depends_on_operation_id,
+                    operation.kind,
+                    operation.endpoint,
+                    request_json,
+                    request_hash,
+                    operation.idempotency_key,
+                    operation.http_method.upper(),
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO session_turns (
+                    session_id, local_sequence, operation_id, source_id, turn_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    local_sequence,
+                    operation.operation_id,
+                    turn.source_id,
+                    turn.turn_hash,
+                ),
+            )
+            connection.execute(
+                "UPDATE session_state SET next_sequence = ?, updated_at = ? WHERE session_id = ?",
+                (local_sequence + 1, now, session_id),
+            )
+            connection.commit()
+        self._secure_files()
+        return IndexedTurnRecord(
+            session_id=session_id,
+            local_sequence=local_sequence,
+            operation_id=operation.operation_id,
+            source_id=turn.source_id,
+            turn_hash=turn.turn_hash,
+            revision=None,
+            queued=True,
+        )
+
     def index_turn(
         self,
         *,
@@ -654,6 +764,16 @@ class DurableOutbox:
                 "UPDATE session_turns SET revision = ? WHERE operation_id = ?",
                 (revision, operation_id),
             )
+
+    def turn_revision(self, operation_id: str) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT revision FROM session_turns WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        if row is None or row["revision"] is None:
+            return None
+        return int(row["revision"])
 
     def _validate_operation(self, operation: NewOperation) -> None:
         if not operation.operation_id or not operation.idempotency_key:
@@ -1143,6 +1263,7 @@ __all__ = [
     "FlushReport",
     "IndexedTurnRecord",
     "NewOperation",
+    "NewTurnOperation",
     "OperationConflictError",
     "OperationState",
     "OutboxClosedError",

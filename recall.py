@@ -32,6 +32,7 @@ class RecallObservation:
     duration_ms: float
     item_count: int = 0
     request_id: str = ""
+    rendered_token_estimate: int | None = None
     error_class: str = ""
 
 
@@ -125,6 +126,7 @@ class RecallCoordinator:
                 started_at,
                 item_count=result.total_items,
                 request_id=result.request_id,
+                rendered_token_estimate=result.rendered_token_estimate,
             )
         )
         if not result.markdown.strip():
@@ -172,6 +174,7 @@ class RecallCoordinator:
                 started_at,
                 item_count=result.total_items,
                 request_id=result.request_id,
+                rendered_token_estimate=result.rendered_token_estimate,
             )
         )
 

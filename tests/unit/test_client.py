@@ -162,7 +162,11 @@ def test_context_pack_uses_fixed_scope_and_recall_budget(
             "markdown_token_budget": 900,
         }
         assert request.extensions["timeout"]["read"] == expected_timeout
-        return httpx.Response(200, json=_context_response())
+        return httpx.Response(
+            200,
+            json=_context_response(),
+            headers={"X-Request-ID": "req_server_context"},
+        )
 
     request = schemas.ContextPackRequest(
         goal="remember the lantern",
@@ -174,6 +178,53 @@ def test_context_pack_uses_fixed_scope_and_recall_budget(
 
     assert response.markdown == "# Memory\nLantern"
     assert response.rendered_item_ids == ("raw_memory:abc",)
+    assert response.request_id == "req_server_context"
+
+
+def test_success_response_body_is_bounded(plugin_module):
+    client_module, _ = _modules(plugin_module)
+    oversized = b"{" + b"x" * client_module.MAX_SUCCESS_BODY_BYTES + b"}"
+
+    with (
+        _client(
+            client_module,
+            lambda _request: httpx.Response(200, content=oversized),
+        ) as client,
+        pytest.raises(client_module.SibylProtocolError, match="safe body limit"),
+    ):
+        client.auth_me()
+
+
+@pytest.mark.parametrize(
+    ("estimated_tokens", "markdown"),
+    [
+        (901, "# Memory\nLantern"),
+        (42, "x" * (900 * 16 + 1)),
+    ],
+)
+def test_context_pack_rejects_server_budget_overruns(
+    plugin_module,
+    estimated_tokens: int,
+    markdown: str,
+):
+    client_module, schemas = _modules(plugin_module)
+    response = _context_response()
+    response["usage_metadata"] = {"estimated_tokens": estimated_tokens}
+    response["markdown"] = markdown
+    request = schemas.ContextPackRequest(
+        goal="remember the lantern",
+        project="project_home",
+        agent_id="hermes:home:nova",
+    )
+
+    with (
+        _client(
+            client_module,
+            lambda _request: httpx.Response(200, json=response),
+        ) as client,
+        pytest.raises(client_module.SibylProtocolError),
+    ):
+        client.context_pack(request)
 
 
 def test_mutation_methods_send_keys_and_require_matching_receipts(plugin_module):

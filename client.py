@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from dataclasses import replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import quote
@@ -34,6 +35,8 @@ MANUAL_CONTEXT_TIMEOUT_SECONDS = 10.0
 MUTATION_TIMEOUT_SECONDS = 10.0
 PROBE_TIMEOUT_SECONDS = 10.0
 MAX_ERROR_BODY_BYTES = 16 * 1024
+MAX_SUCCESS_BODY_BYTES = 2 * 1024 * 1024
+MAX_CONTEXT_BYTES_PER_TOKEN = 16
 _MAX_ERROR_PREVIEW_CHARS = 512
 _REQUEST_ID_HEADER = "X-Request-ID"
 _IDEMPOTENCY_HEADER = "Idempotency-Key"
@@ -128,6 +131,15 @@ def _bounded_error_body(response: httpx.Response) -> tuple[bytes, bool]:
     return bytes(body), False
 
 
+def _bounded_success_body(response: httpx.Response) -> bytes:
+    body = bytearray()
+    for chunk in response.iter_bytes():
+        if len(body) + len(chunk) > MAX_SUCCESS_BODY_BYTES:
+            raise ValueError("success response exceeds the safe body limit")
+        body.extend(chunk)
+    return bytes(body)
+
+
 def _safe_preview(body: bytes) -> str:
     decoded = body.decode("utf-8", errors="replace")
     cleaned = _CONTROL_CHARACTERS.sub("?", decoded).replace("\r", " ").replace("\n", " ")
@@ -209,7 +221,29 @@ class SibylClient:
             timeout_seconds=(
                 MANUAL_CONTEXT_TIMEOUT_SECONDS if manual else BACKGROUND_CONTEXT_TIMEOUT_SECONDS
             ),
+            validate=lambda response: self._validate_context_budget(
+                response,
+                request.markdown_token_budget,
+            ),
         )
+
+    @staticmethod
+    def _validate_context_budget(
+        response: ContextPackResponse,
+        markdown_token_budget: int,
+    ) -> None:
+        estimated_tokens = response.usage_metadata.get("estimated_tokens")
+        if (
+            isinstance(estimated_tokens, int)
+            and not isinstance(estimated_tokens, bool)
+            and estimated_tokens > markdown_token_budget
+        ):
+            raise SchemaError("response exceeds the requested markdown token budget")
+        if response.markdown is None:
+            return
+        maximum_bytes = markdown_token_budget * MAX_CONTEXT_BYTES_PER_TOKEN
+        if len(response.markdown.encode("utf-8")) > maximum_bytes:
+            raise SchemaError("response markdown exceeds the safe size budget")
 
     def expose_context(
         self,
@@ -303,6 +337,7 @@ class SibylClient:
         payload: JSONObject | None = None,
         idempotency_key: str | None = None,
         receipt: Callable[[_ResponseT], MutationReceipt | None] | None = None,
+        validate: Callable[[_ResponseT], None] | None = None,
     ) -> _ResponseT:
         request_id = self._request_id_factory()
         headers = {_REQUEST_ID_HEADER: request_id}
@@ -321,7 +356,14 @@ class SibylClient:
             ) as response:
                 if response.is_error:
                     self._raise_http_error(response, request_id=request_id)
-                body = response.read()
+                try:
+                    body = _bounded_success_body(response)
+                except ValueError as exc:
+                    raise SibylProtocolError(
+                        "Sibyl success response exceeded the safe body limit",
+                        request_id=request_id,
+                        status_code=response.status_code,
+                    ) from exc
         except SibylClientError:
             raise
         except httpx.HTTPError as exc:
@@ -333,6 +375,16 @@ class SibylClient:
         try:
             response_payload = _json_object(body)
             parsed = parser(response_payload)
+            if isinstance(parsed, ContextPackResponse):
+                parsed = cast(
+                    "_ResponseT",
+                    replace(
+                        parsed,
+                        request_id=response.headers.get(_REQUEST_ID_HEADER, request_id),
+                    ),
+                )
+            if validate is not None:
+                validate(parsed)
             if receipt is not None:
                 if idempotency_key is None:
                     raise SchemaError("receipt validation requires an idempotency key")

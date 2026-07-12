@@ -14,6 +14,7 @@ from outbox import (
     ClaimLostError,
     DurableOutbox,
     NewOperation,
+    NewTurnOperation,
     OperationConflictError,
     OperationState,
     Outcome,
@@ -366,6 +367,39 @@ def test_session_sequences_and_turn_index_survive_reopen(tmp_path: Path) -> None
     assert reopened.reserve_sequence("session-1") == 3
     assert reopened.session_reconcile_required("session-1") is True
     assert reopened.session_parent_id("session-1") == "parent-1"
+
+
+def test_turn_operation_and_index_commit_atomically(tmp_path: Path) -> None:
+    outbox = DurableOutbox(tmp_path)
+
+    indexed = outbox.enqueue_turn(
+        "session-1",
+        lambda sequence: NewTurnOperation(
+            operation=operation(f"turn-{sequence}"),
+            source_id=f"source-{sequence}",
+            turn_hash="hash-1",
+        ),
+    )
+    outbox.close()
+
+    reopened = DurableOutbox(tmp_path)
+    assert reopened.snapshot().total == 1
+    assert reopened.indexed_turns("session-1") == [indexed]
+    assert reopened.reserve_sequence("session-1") == 2
+
+
+def test_failed_turn_factory_rolls_back_sequence_and_operation(tmp_path: Path) -> None:
+    outbox = DurableOutbox(tmp_path)
+
+    def fail(_sequence: int) -> NewTurnOperation:
+        raise RuntimeError("crash before durable turn")
+
+    with pytest.raises(RuntimeError, match="crash before durable turn"):
+        outbox.enqueue_turn("session-1", fail)
+
+    assert outbox.snapshot().total == 0
+    assert outbox.indexed_turns("session-1") == []
+    assert outbox.reserve_sequence("session-1") == 1
 
 
 def test_turn_index_reports_queued_state_and_revision(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ from .outbox import (
     ClaimedOperation,
     DurableOutbox,
     NewOperation,
+    NewTurnOperation,
     OperationState,
     ResultAction,
     classify_http_failure,
@@ -52,6 +53,7 @@ from .schemas import (
     RawMemoryRequest,
 )
 from .sessions import IndexedTurn, TurnReconciliationError, TurnStartQueue, plan_rewind_corrections
+from .trust import CredentialRequirement, UnsafeCredentialError, validate_credential
 
 if TYPE_CHECKING:
     from .provider import RuntimeContext
@@ -65,6 +67,14 @@ def _hash_parts(*parts: str) -> str:
     return hashlib.sha256(b"\0".join(part.encode("utf-8") for part in parts)).hexdigest()
 
 
+def normalize_hermes_user_message(message: str) -> str:
+    try:
+        from agent.skill_commands import extract_user_instruction_from_skill_message
+    except ImportError:
+        return message
+    return extract_user_instruction_from_skill_message(message) or ""
+
+
 class SibylRuntime:
     def __init__(
         self,
@@ -73,6 +83,7 @@ class SibylRuntime:
         client: SibylClient | None = None,
         outbox: DurableOutbox | None = None,
         executor: Executor | None = None,
+        shutdown_timeout_seconds: float = 4.0,
     ) -> None:
         self._context = context
         self._client = client or SibylClient(
@@ -82,6 +93,7 @@ class SibylRuntime:
         self._outbox = outbox or DurableOutbox(context.hermes_home)
         self._executor = executor or ThreadPoolExecutor(thread_name_prefix="sibyl-provider")
         self._owns_executor = executor is None
+        self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._turns = TurnStartQueue()
         self._session_id = context.session_id
         self._parent_session_id = context.parent_session_id
@@ -113,10 +125,11 @@ class SibylRuntime:
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
-        if not message:
+        clean_message = normalize_hermes_user_message(message)
+        if not clean_message:
             return
-        self._turns.record(self._session_id, turn_number, message)
-        self._recall.schedule(message, session_id=self._session_id)
+        self._turns.record(self._session_id, turn_number, clean_message)
+        self._recall.schedule(clean_message, session_id=self._session_id)
         self._executor.submit(self._validate_and_flush)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -135,15 +148,21 @@ class SibylRuntime:
     ) -> None:
         if self._context.agent_context != "primary" or not self._context.config.automatic_capture:
             return
+        normalized_user_content = normalize_hermes_user_message(user_content)
+        if not normalized_user_content:
+            return
         active_session = session_id or self._session_id
         if messages is not None and self._outbox.session_reconcile_required(active_session):
             self._reconcile_session(
                 active_session,
                 messages,
-                current_turn=(user_content, assistant_content),
+                current_turn=(normalized_user_content, assistant_content),
             )
         try:
-            turn_number = self._turns.consume(active_session, user_content).turn_number
+            turn_number = self._turns.consume(
+                active_session,
+                normalized_user_content,
+            ).turn_number
         except TurnReconciliationError as exc:
             turn_number = None
             log.warning(
@@ -155,7 +174,7 @@ class SibylRuntime:
             )
         operation_id = self._enqueue_capture(
             active_session,
-            user_content,
+            normalized_user_content,
             assistant_content,
             turn_number=turn_number,
         )
@@ -232,16 +251,28 @@ class SibylRuntime:
         self._closed = True
         self._recall.shutdown()
         if self._credential_safe:
+            closer = threading.Thread(
+                target=self._flush_and_close,
+                name="sibyl-provider-shutdown",
+                daemon=True,
+            )
+            closer.start()
+            closer.join(self._shutdown_timeout_seconds)
+        else:
+            self._outbox.close()
+            self._client.close()
+        if self._owns_executor and isinstance(self._executor, ThreadPoolExecutor):
+            self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _flush_and_close(self) -> None:
+        try:
             self._outbox.shutdown(
                 f"shutdown-{threading.get_ident()}",
                 self._execute_operation,
-                timeout_seconds=4.0,
+                timeout_seconds=self._shutdown_timeout_seconds,
             )
-        else:
-            self._outbox.close()
-        self._client.close()
-        if self._owns_executor and isinstance(self._executor, ThreadPoolExecutor):
-            self._executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            self._client.close()
 
     def _validate_and_flush(self) -> None:
         if self._closed:
@@ -280,30 +311,19 @@ class SibylRuntime:
             self._credential_safe = True
 
     def _validate_credential(self, response: AuthMeResponse) -> None:
-        credential = response.credential
-        failures: list[str] = []
-        if credential.type != "api_key":
-            failures.append("credential must be an API key")
-        if "api:write" not in credential.scopes:
-            failures.append("api:write scope is required")
-        if (
-            not credential.project_ids
-            or self._context.config.project_id not in credential.project_ids
-        ):
-            failures.append("configured project is not the key's restricted project")
-        if (
-            not credential.memory_space_ids
-            or self._context.config.memory_space_id not in credential.memory_space_ids
-        ):
-            failures.append("configured memory space is not restricted on the key")
-        if credential.agent_id != self._context.agent_id:
-            failures.append("authenticated agent identity does not match Hermes")
-        if credential.capability_profile != "memory_provider":
-            failures.append("capability_profile must be memory_provider")
-        if failures:
+        try:
+            validate_credential(
+                response.credential,
+                CredentialRequirement(
+                    project_id=self._context.config.project_id,
+                    memory_space_id=self._context.config.memory_space_id,
+                    agent_id=self._context.agent_id,
+                ),
+            )
+        except UnsafeCredentialError as exc:
             self._credential_safe = False
-            self._credential_error = "; ".join(failures)
-            raise RuntimeError(self._credential_error)
+            self._credential_error = str(exc)
+            raise
 
     def _fetch_context(self, query: str, session_id: str) -> RecallResult:
         self._ensure_credential_safe()
@@ -321,16 +341,27 @@ class SibylRuntime:
             markdown=response.markdown or "",
             rendered_item_ids=response.rendered_item_ids,
             total_items=response.total_items,
+            request_id=response.request_id,
+            rendered_token_estimate=self._token_estimate(response.usage_metadata),
         )
 
-    def _record_delivery(self, session_id: str, query_hash: str, result: RecallResult) -> None:
+    def _record_delivery(
+        self,
+        session_id: str,
+        query_hash: str,
+        result: RecallResult,
+        *,
+        automatic: bool = True,
+    ) -> None:
         if not result.rendered_item_ids:
             return
         session_hash = self._session_hash(session_id)
+        delivery_sequence = self._outbox.reserve_sequence(f"{session_id}:exposure")
         operation_id = _hash_parts(
             self._context.agent_id,
             session_hash,
             query_hash,
+            str(delivery_sequence),
             *result.rendered_item_ids,
         )
         request = ContextExposureRequest(
@@ -338,7 +369,7 @@ class SibylRuntime:
             project_id=self._context.config.project_id,
             session_id_hash=session_hash,
             query_hash=query_hash,
-            provider_operation_id=operation_id,
+            automatic=automatic,
         )
         self._outbox.enqueue(
             NewOperation(
@@ -372,7 +403,10 @@ class SibylRuntime:
             total_items=response.total_items,
         )
         self._record_delivery(
-            self._session_id, hashlib.sha256(args.query.encode()).hexdigest(), result
+            self._session_id,
+            hashlib.sha256(args.query.encode()).hexdigest(),
+            result,
+            automatic=False,
         )
         return {
             "markdown": result.markdown,
@@ -508,47 +542,45 @@ class SibylRuntime:
         turn_number: int | None,
     ) -> str:
         parent_session_id = self._outbox.session_parent_id(session_id) or ""
-        local_sequence = self._outbox.reserve_sequence(
-            session_id,
-            parent_session_id=parent_session_id,
-        )
-        capture = build_turn_capture(
-            agent_id=self._context.agent_id,
-            agent_workspace=self._context.agent_workspace,
-            agent_identity=self._context.agent_identity,
-            session_id=session_id,
-            parent_session_id=parent_session_id,
-            local_sequence=local_sequence,
-            turn_number=turn_number,
-            user_content=user_content,
-            assistant_content=assistant_content,
-            platform=self._context.platform,
-            project_id=self._context.config.project_id,
-            memory_space_id=self._context.config.memory_space_id,
-            hermes_version=HERMES_VERSION,
-            adapter_version=ADAPTER_VERSION,
-            participant_ids=self._participant_ids(),
-            chat_id=self._stable_context_value("chat_id", "group_id", "conversation_id"),
-            thread_id=self._stable_context_value("thread_id"),
-        )
-        request = cast("JSONObject", capture.payload)
-        self._outbox.enqueue(
-            NewOperation(
-                operation_id=capture.identity.operation_id,
-                kind="raw_capture",
-                endpoint="/api/memory/raw",
-                request=request,
-                idempotency_key=capture.identity.idempotency_key,
+
+        def build_operation(local_sequence: int) -> NewTurnOperation:
+            capture = build_turn_capture(
+                agent_id=self._context.agent_id,
+                agent_workspace=self._context.agent_workspace,
+                agent_identity=self._context.agent_identity,
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                local_sequence=local_sequence,
+                turn_number=turn_number,
+                user_content=user_content,
+                assistant_content=assistant_content,
+                platform=self._context.platform,
+                project_id=self._context.config.project_id,
+                memory_space_id=self._context.config.memory_space_id,
+                hermes_version=HERMES_VERSION,
+                adapter_version=ADAPTER_VERSION,
+                participant_ids=self._participant_ids(),
+                chat_id=self._stable_context_value("chat_id", "group_id", "conversation_id"),
+                thread_id=self._stable_context_value("thread_id"),
             )
-        )
-        self._outbox.index_turn(
+            return NewTurnOperation(
+                operation=NewOperation(
+                    operation_id=capture.identity.operation_id,
+                    kind="raw_capture",
+                    endpoint="/api/memory/raw",
+                    request=cast("JSONObject", capture.payload),
+                    idempotency_key=capture.identity.idempotency_key,
+                ),
+                source_id=capture.identity.source_id,
+                turn_hash=capture.identity.turn_hash,
+            )
+
+        indexed = self._outbox.enqueue_turn(
             session_id=session_id,
-            local_sequence=local_sequence,
-            operation_id=capture.identity.operation_id,
-            source_id=capture.identity.source_id,
-            turn_hash=capture.identity.turn_hash,
+            factory=build_operation,
+            parent_session_id=parent_session_id,
         )
-        return capture.identity.operation_id
+        return indexed.operation_id
 
     def _reconcile_session(
         self,
@@ -642,7 +674,21 @@ class SibylRuntime:
                 )
             if operation.endpoint.endswith("/corrections"):
                 source_id = self._correction_source_id(operation.endpoint)
-                request = self._correction_request(operation.request)
+                correction_data = dict(operation.request)
+                if (
+                    correction_data.get("expected_revision") is None
+                    and operation.depends_on_operation_id is not None
+                ):
+                    dependency_revision = self._outbox.turn_revision(
+                        operation.depends_on_operation_id
+                    )
+                    if dependency_revision is None:
+                        return AttemptResult.failure(
+                            ResultAction.RETRY,
+                            error="source dependency revision is not available",
+                        )
+                    correction_data["expected_revision"] = dependency_revision
+                request = self._correction_request(correction_data)
                 if operation.state is OperationState.RECONCILE_REVISION:
                     return self._reconcile_correction(operation, source_id, request)
                 response = self._client.apply_correction(
@@ -665,7 +711,7 @@ class SibylRuntime:
                     status=exc.status_code,
                     error_code=exc.error,
                     is_correction=operation.endpoint.endswith("/corrections"),
-                    dependency_pending=operation.depends_on_operation_id is not None,
+                    dependency_pending=False,
                 ),
                 status=exc.status_code,
                 error=exc.error,
@@ -676,7 +722,7 @@ class SibylRuntime:
                     status=exc.status_code,
                     error_code=exc.error,
                     is_correction=operation.endpoint.endswith("/corrections"),
-                    dependency_pending=operation.depends_on_operation_id is not None,
+                    dependency_pending=False,
                 ),
                 status=exc.status_code,
                 error=exc.error,
@@ -785,6 +831,13 @@ class SibylRuntime:
         ]
         return list(dict.fromkeys(value for value in values if value))
 
+    @staticmethod
+    def _token_estimate(usage_metadata: JSONObject) -> int | None:
+        value = usage_metadata.get("estimated_tokens")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
     def _stable_context_value(self, *keys: str) -> str:
         for key in keys:
             value = self._context.kwargs.get(key)
@@ -810,6 +863,7 @@ class SibylRuntime:
                 "duration_ms": observation.duration_ms,
                 "item_count": observation.item_count,
                 "request_id": observation.request_id,
+                "rendered_token_estimate": observation.rendered_token_estimate,
                 "error_class": observation.error_class,
             },
         )
@@ -819,4 +873,4 @@ def build_runtime(context: RuntimeContext) -> SibylRuntime:
     return SibylRuntime(context)
 
 
-__all__ = ["SibylRuntime", "build_runtime"]
+__all__ = ["SibylRuntime", "build_runtime", "normalize_hermes_user_message"]

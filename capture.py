@@ -41,6 +41,23 @@ def canonical_request_hash(payload: dict[str, Any]) -> str:
     return _sha256(encoded)
 
 
+def _message_text(content: Any) -> str:
+    try:
+        from agent.message_content import flatten_message_text
+    except ImportError:
+        return content if isinstance(content, str) else ""
+    return flatten_message_text(content)
+
+
+def _user_message_text(content: Any) -> str:
+    text = _message_text(content)
+    try:
+        from agent.skill_commands import extract_user_instruction_from_skill_message
+    except ImportError:
+        return text
+    return extract_user_instruction_from_skill_message(text) or ""
+
+
 def _delimited_hash(*parts: str) -> str:
     return _sha256(_NUL.join(part.encode("utf-8") for part in parts))
 
@@ -182,11 +199,15 @@ def committed_turns(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     pending_user: str | None = None
     for message in messages:
         role = message.get("role")
-        content = message.get("content")
-        if role == "user" and isinstance(content, str):
+        content = (
+            _user_message_text(message.get("content"))
+            if role == "user"
+            else _message_text(message.get("content"))
+        )
+        if role == "user" and content:
             pending_user = content
             continue
-        if role != "assistant" or pending_user is None or not isinstance(content, str):
+        if role != "assistant" or pending_user is None or not content:
             continue
         if message.get("tool_calls"):
             continue

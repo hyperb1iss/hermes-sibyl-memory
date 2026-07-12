@@ -63,3 +63,36 @@ def test_correction_never_accepts_delete_or_redact():
     for action in ("delete", "redact"):
         with pytest.raises(ToolValidationError, match="action"):
             CorrectionToolArgs.parse({"source_id": "source-1", "action": action, "reason": "no"})
+
+
+def test_correction_limits_match_sibyl_request_contract():
+    accepted = CorrectionToolArgs.parse(
+        {
+            "source_id": "source-1",
+            "action": "superseded",
+            "reason": "r" * 2_000,
+            "replacement_source_id": "s" * 500,
+        }
+    )
+    assert len(accepted.reason) == 2_000
+    assert len(accepted.replacement_source_id or "") == 500
+
+    with pytest.raises(ToolValidationError, match="2000"):
+        CorrectionToolArgs.parse(
+            {"source_id": "source-1", "action": "stale", "reason": "r" * 2_001}
+        )
+    with pytest.raises(ToolValidationError, match="500"):
+        CorrectionToolArgs.parse(
+            {
+                "source_id": "source-1",
+                "action": "duplicate",
+                "reason": "duplicate",
+                "duplicate_of_source_id": "s" * 501,
+            }
+        )
+
+    correction = next(schema for schema in TOOL_SCHEMAS if schema["name"] == "sibyl_correct")
+    properties = correction["parameters"]["properties"]
+    assert properties["reason"]["maxLength"] == 2_000
+    assert properties["replacement_source_id"]["maxLength"] == 500
+    assert properties["duplicate_of_source_id"]["maxLength"] == 500

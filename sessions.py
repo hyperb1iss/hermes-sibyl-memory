@@ -42,13 +42,23 @@ class TurnStartQueue:
             queue = self._turns.get(session_id)
             if not queue:
                 raise TurnReconciliationError(f"no turn-start record for session {session_id!r}")
-            pending = queue[0]
-            if pending.user_message_hash != actual_hash:
+            match_index = next(
+                (
+                    index
+                    for index, pending in enumerate(queue)
+                    if pending.user_message_hash == actual_hash
+                ),
+                None,
+            )
+            if match_index is None:
+                pending = queue[0]
                 raise TurnReconciliationError(
-                    "completed turn does not match the oldest turn-start record: "
+                    "completed turn does not match any queued turn-start record: "
                     f"session={session_id!r} turn={pending.turn_number}"
                 )
-            queue.popleft()
+            for _ in range(match_index):
+                queue.popleft()
+            pending = queue.popleft()
             if not queue:
                 self._turns.pop(session_id, None)
             return pending
