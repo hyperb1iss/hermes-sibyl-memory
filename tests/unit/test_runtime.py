@@ -22,6 +22,8 @@ class FakeClient:
         self.context_requests = []
         self.exposures = []
         self.raw_requests = []
+        self.correction_previews = []
+        self.corrections = []
         self.closed = False
 
     def auth_me(self):
@@ -50,6 +52,7 @@ class FakeClient:
             markdown="# Recalled\n\nTreat this as evidence.",
             rendered_item_ids=("decision_1",),
             total_items=1,
+            usage_hint="Use relevant evidence only.",
         )
 
     def expose_context(self, request, *, idempotency_key: str):
@@ -64,13 +67,19 @@ class FakeClient:
         )
 
     def preview_correction(self, source_id: str, request):
+        self.correction_previews.append((source_id, request))
         return SimpleNamespace(
+            allowed=True,
+            source_id=source_id,
+            action=request.action,
             target_lifecycle_state="active",
             current_revision=2,
             revision=2,
+            policy_reasons=("project_scope_write_allowed",),
         )
 
     def apply_correction(self, source_id: str, request, *, idempotency_key: str):
+        self.corrections.append((source_id, request, idempotency_key))
         return SimpleNamespace(mutation_receipt=SimpleNamespace(replayed=False))
 
     def close(self) -> None:
@@ -200,3 +209,48 @@ def test_unsafe_unrestricted_credential_never_flushes_writes(plugin_module, tmp_
 
     assert outbox.snapshot().by_state == {"pending": 1}
     assert client.raw_requests == []
+
+
+def test_manual_tools_keep_scope_fixed_and_write_through_outbox(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+
+    recall = runtime.handle_tool_call("sibyl_recall", {"query": "find the decision"})
+    remembered = runtime.handle_tool_call(
+        "sibyl_remember",
+        {
+            "title": "Decision",
+            "content": "Use Sibyl.",
+            "kind": "decision",
+            "tags": ["memory"],
+        },
+        tool_call_id="call-1",
+    )
+
+    assert "# Recalled" in recall
+    assert '"queued":true' in remembered
+    assert client.raw_requests[-1][0].project_id == "project_home"
+    assert client.raw_requests[-1][0].metadata["remember_kind"] == "decision"
+    assert outbox.snapshot().total == 0
+
+
+def test_correction_tool_previews_before_revision_guarded_apply(plugin_module, tmp_path):
+    runtime, context, client, outbox = _runtime_parts(plugin_module, tmp_path)
+    runtime.initialize(context)
+
+    result = runtime.handle_tool_call(
+        "sibyl_correct",
+        {
+            "source_id": "hermes:turn:one",
+            "action": "stale",
+            "reason": "superseded by current state",
+            "apply": True,
+        },
+        tool_call_id="call-2",
+    )
+
+    assert '"queued":true' in result
+    assert len(client.correction_previews) == 1
+    assert len(client.corrections) == 1
+    assert client.corrections[0][1].expected_revision == 2
+    assert outbox.snapshot().total == 0

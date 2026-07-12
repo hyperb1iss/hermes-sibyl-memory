@@ -147,6 +147,7 @@ class ContextExposureRequest:
     project_id: str
     session_id_hash: str | None = None
     query_hash: str | None = None
+    provider_operation_id: str | None = None
     automatic: bool = True
 
     def to_json(self) -> JSONObject:
@@ -155,6 +156,8 @@ class ContextExposureRequest:
             metadata["session_id_hash"] = self.session_id_hash
         if self.query_hash is not None:
             metadata["query_hash"] = self.query_hash
+        if self.provider_operation_id is not None:
+            metadata["provider_operation_id"] = self.provider_operation_id
         return {
             "exposed_ids": list(self.exposed_ids),
             "project_id": self.project_id,

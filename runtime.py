@@ -11,7 +11,13 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import quote, unquote
 
-from .capture import build_turn_capture, committed_turn_fingerprints, committed_turns, turn_hash
+from .capture import (
+    build_turn_capture,
+    canonical_request_hash,
+    committed_turn_fingerprints,
+    committed_turns,
+    turn_hash,
+)
 from .client import (
     SibylClient,
     SibylConflictError,
@@ -38,6 +44,14 @@ from .schemas import (
     RawMemoryRequest,
 )
 from .sessions import IndexedTurn, TurnReconciliationError, TurnStartQueue, plan_rewind_corrections
+from .tools import (
+    CORRECTION_ACTIONS,
+    TOOL_SCHEMAS,
+    CorrectionToolArgs,
+    RecallToolArgs,
+    RememberToolArgs,
+    ToolValidationError,
+)
 
 if TYPE_CHECKING:
     from .provider import RuntimeContext
@@ -179,10 +193,35 @@ class SibylRuntime:
             self._recall.discard_session(new_session_id)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return []
+        return TOOL_SCHEMAS if self._context.config.manual_tools else []
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
-        return json.dumps({"error": f"Unknown Sibyl tool: {tool_name}"}, separators=(",", ":"))
+        try:
+            if tool_name == "sibyl_recall":
+                result = self._tool_recall(RecallToolArgs.parse(args))
+            elif tool_name == "sibyl_remember":
+                result = self._tool_remember(RememberToolArgs.parse(args), kwargs)
+            elif tool_name == "sibyl_correct":
+                result = self._tool_correct(CorrectionToolArgs.parse(args), kwargs)
+            else:
+                raise ToolValidationError(f"Unknown Sibyl tool: {tool_name}")
+            return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+        except ToolValidationError as exc:
+            return json.dumps({"error": "invalid_arguments", "message": str(exc)})
+        except (SibylHTTPError, SibylProtocolError, SibylTransportError) as exc:
+            return json.dumps(
+                {"error": "sibyl_unavailable", "error_class": type(exc).__name__},
+                separators=(",", ":"),
+            )
+        except Exception as exc:
+            log.warning(
+                "sibyl_tool_failed",
+                extra={"tool_name": tool_name, "error_class": type(exc).__name__},
+            )
+            return json.dumps(
+                {"error": "sibyl_tool_failed", "error_class": type(exc).__name__},
+                separators=(",", ":"),
+            )
 
     def shutdown(self) -> None:
         if self._closed:
@@ -296,6 +335,7 @@ class SibylRuntime:
             project_id=self._context.config.project_id,
             session_id_hash=session_hash,
             query_hash=query_hash,
+            provider_operation_id=operation_id,
         )
         self._outbox.enqueue(
             NewOperation(
@@ -307,6 +347,154 @@ class SibylRuntime:
             )
         )
         self._executor.submit(self._validate_and_flush)
+
+    def _tool_recall(self, args: RecallToolArgs) -> dict[str, Any]:
+        self._ensure_credential_safe()
+        response = self._client.context_pack(
+            ContextPackRequest(
+                goal=args.query,
+                project=self._context.config.project_id,
+                agent_id=self._context.agent_id,
+                intent=args.intent,
+                layer=args.layer,
+                limit=self._context.config.context_limit,
+                related_limit=self._context.config.context_related_limit,
+                markdown_token_budget=2_000,
+            ),
+            manual=True,
+        )
+        result = RecallResult(
+            markdown=response.markdown or "",
+            rendered_item_ids=response.rendered_item_ids,
+            total_items=response.total_items,
+        )
+        self._record_delivery(
+            self._session_id, hashlib.sha256(args.query.encode()).hexdigest(), result
+        )
+        return {
+            "markdown": result.markdown,
+            "item_ids": list(result.rendered_item_ids),
+            "item_count": result.total_items,
+            "usage_hint": response.usage_hint,
+        }
+
+    def _tool_remember(
+        self,
+        args: RememberToolArgs,
+        call_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        call_identity = str(call_context.get("tool_call_id") or "").strip()
+        if not call_identity:
+            call_identity = str(self._outbox.reserve_sequence(f"{self._session_id}:manual"))
+        content_hash = hashlib.sha256(args.content.encode("utf-8")).hexdigest()
+        operation_id = _hash_parts(
+            self._context.agent_id,
+            self._session_id,
+            call_identity,
+            args.kind,
+            content_hash,
+        )
+        source_id = ":".join(
+            (
+                "hermes",
+                "remember",
+                quote(self._context.agent_id, safe=""),
+                quote(self._session_id, safe=""),
+                quote(call_identity, safe=""),
+                content_hash[:16],
+            )
+        )
+        request = RawMemoryRequest(
+            title=args.title,
+            raw_content=args.content,
+            source_id=source_id,
+            project_id=self._context.config.project_id,
+            tags=args.tags,
+            metadata={
+                "remember_kind": args.kind,
+                "agent_id": self._context.agent_id,
+                "session_id": self._session_id,
+                "provider_operation_id": operation_id,
+                "trust_level": "untrusted_user_memory",
+            },
+            provenance={
+                "adapter": "hermes-sibyl-memory",
+                "adapter_version": ADAPTER_VERSION,
+            },
+        )
+        payload = request.to_json()
+        metadata = cast("JSONObject", payload["metadata"])
+        metadata["provider_request_hash"] = canonical_request_hash(payload)
+        self._outbox.enqueue(
+            NewOperation(
+                operation_id=operation_id,
+                kind="manual_remember",
+                endpoint="/api/memory/raw",
+                request=payload,
+                idempotency_key=f"hermes-remember-{operation_id}",
+            )
+        )
+        self._executor.submit(self._validate_and_flush)
+        return {"queued": True, "operation_id": operation_id, "source_id": source_id}
+
+    def _tool_correct(
+        self,
+        args: CorrectionToolArgs,
+        call_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        api_action = CORRECTION_ACTIONS[args.action]
+        preview_request = CorrectionRequest(
+            action=api_action,
+            reason=args.reason,
+            revised_content=args.revised_content,
+            replacement_source_id=args.replacement_source_id,
+            duplicate_of_source_id=args.duplicate_of_source_id,
+        )
+        self._ensure_credential_safe()
+        preview = self._client.preview_correction(args.source_id, preview_request)
+        preview_result = {
+            "allowed": preview.allowed,
+            "source_id": preview.source_id,
+            "action": preview.action,
+            "target_lifecycle_state": preview.target_lifecycle_state,
+            "current_revision": preview.current_revision,
+            "policy_reasons": list(preview.policy_reasons),
+        }
+        if not args.apply or not preview.allowed:
+            return {"preview": preview_result, "queued": False}
+        if preview.current_revision is None:
+            raise ToolValidationError("correction preview omitted current_revision")
+        call_identity = str(call_context.get("tool_call_id") or "").strip()
+        if not call_identity:
+            call_identity = str(self._outbox.reserve_sequence(f"{self._session_id}:correction"))
+        operation_id = _hash_parts(
+            self._context.agent_id,
+            self._session_id,
+            call_identity,
+            args.source_id,
+            api_action,
+            str(preview.current_revision),
+        )
+        request = CorrectionRequest(
+            action=api_action,
+            reason=args.reason,
+            revised_content=args.revised_content,
+            replacement_source_id=args.replacement_source_id,
+            duplicate_of_source_id=args.duplicate_of_source_id,
+            expected_revision=preview.current_revision,
+            metadata={"provider_operation_id": operation_id},
+        )
+        self._outbox.enqueue(
+            NewOperation(
+                operation_id=operation_id,
+                kind="manual_correction",
+                endpoint=f"/api/memory/inspect/{quote(args.source_id, safe='')}/corrections",
+                request=request.to_json(),
+                idempotency_key=f"hermes-correction-{operation_id}",
+            )
+        )
+        self._executor.submit(self._validate_and_flush)
+        return {"preview": preview_result, "queued": True, "operation_id": operation_id}
 
     def _enqueue_capture(
         self,
@@ -428,7 +616,7 @@ class SibylRuntime:
 
     def _execute_operation(self, operation: ClaimedOperation) -> AttemptResult:
         try:
-            if operation.kind == "raw_capture":
+            if operation.endpoint.endswith("/memory/raw"):
                 response = self._client.remember_raw(
                     self._raw_request(operation.request),
                     idempotency_key=operation.idempotency_key,
