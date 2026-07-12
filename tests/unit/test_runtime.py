@@ -200,8 +200,16 @@ def test_skill_wrapper_is_removed_from_turn_matching_and_capture(plugin_module, 
     )
 
     runtime.on_turn_start(1, expanded)
-    runtime.sync_turn(expanded, "captured answer")
+    runtime.sync_turn(
+        expanded,
+        "captured answer",
+        messages=[
+            {"role": "user", "content": expanded},
+            {"role": "assistant", "content": "captured answer"},
+        ],
+    )
 
+    assert len(client.raw_requests) == 1
     request, _ = client.raw_requests[-1]
     assert request.raw_content == (
         "[User]\nremember only this request\n\n[Assistant]\ncaptured answer"
