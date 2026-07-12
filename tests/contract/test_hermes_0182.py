@@ -15,6 +15,14 @@ RUNTIME_FILES = [
     "provider.py",
     "config.py",
     "cli.py",
+    "capture.py",
+    "client.py",
+    "outbox.py",
+    "recall.py",
+    "runtime.py",
+    "schemas.py",
+    "sessions.py",
+    "provider_tools.py",
 ]
 
 pytestmark = pytest.mark.contract
@@ -81,3 +89,83 @@ def test_real_0182_flat_discovery_and_direct_setup(tmp_path, monkeypatch, capsys
     parser = argparse.ArgumentParser()
     commands[0]["setup_fn"](parser)
     assert parser.parse_args(["status"]).sibyl_command == "status"
+
+
+def test_real_0182_memory_manager_routes_lifecycle_and_tools(tmp_path, monkeypatch):
+    pytest.importorskip("plugins.memory")
+    hermes_home = tmp_path / "hermes"
+    _install_flat_plugin(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("SIBYL_API_KEY", "secret-value")
+    (hermes_home / "sibyl.json").write_text(
+        '{"base_url":"https://sibyl.example/api","project_id":"project_test",'
+        '"memory_space_id":"space_test"}',
+        encoding="utf-8",
+    )
+    _clear_loaded_plugin()
+
+    from agent.memory_manager import MemoryManager
+    from plugins import memory
+
+    events = []
+
+    class RecordingRuntime:
+        def initialize(self, context):
+            events.append(("initialize", context.session_id, context.agent_id))
+
+        def on_turn_start(self, turn_number, message, **kwargs):
+            events.append(("turn_start", turn_number, message))
+
+        def prefetch(self, query, *, session_id=""):
+            events.append(("prefetch", query, session_id))
+            return "# Untrusted evidence"
+
+        def queue_prefetch(self, query, *, session_id=""):
+            events.append(("queue_prefetch", query, session_id))
+
+        def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+            events.append(("sync", user_content, assistant_content, session_id, messages))
+
+        def on_session_switch(self, new_session_id, **kwargs):
+            events.append(("switch", new_session_id, kwargs))
+
+        def get_tool_schemas(self):
+            return [{"name": "sibyl_recall", "description": "Recall", "parameters": {}}]
+
+        def handle_tool_call(self, tool_name, args, **kwargs):
+            return '{"handled":true}'
+
+        def shutdown(self):
+            events.append(("shutdown",))
+
+    provider = memory.load_memory_provider("sibyl")
+    assert provider is not None
+    recording = RecordingRuntime()
+    provider._runtime_factory = lambda context: recording
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.initialize_all(
+        "session-1",
+        hermes_home=str(hermes_home),
+        platform="signal",
+        agent_workspace="home",
+        agent_identity="nova",
+    )
+    manager.on_turn_start(1, "current")
+    assert manager.prefetch_all("current", session_id="session-1") == "# Untrusted evidence"
+    manager.sync_all(
+        "current",
+        "answer",
+        session_id="session-1",
+        messages=[{"role": "user", "content": "current"}],
+    )
+    assert manager.flush_pending(timeout=2.0)
+    assert manager.has_tool("sibyl_recall")
+    assert manager.handle_tool_call("sibyl_recall", {"query": "memory"}) == '{"handled":true}'
+    manager.shutdown_all()
+
+    assert events[0] == ("initialize", "session-1", "hermes:home:nova")
+    assert events[1] == ("turn_start", 1, "current")
+    assert events[2] == ("prefetch", "current", "session-1")
+    assert events[3][0] == "sync"
+    assert events[-1] == ("shutdown",)

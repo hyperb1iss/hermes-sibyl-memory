@@ -249,7 +249,18 @@ class SibylMemoryProvider(MemoryProvider):
         return None
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
-        return self._runtime.get_tool_schemas()
+        schemas = self._runtime.get_tool_schemas()
+        if schemas:
+            return schemas
+        try:
+            config = load_provider_config(resolve_hermes_home())
+        except (OSError, ValueError):
+            return []
+        if not config.is_complete or not config.manual_tools:
+            return []
+        from .provider_tools import TOOL_SCHEMAS
+
+        return TOOL_SCHEMAS
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
         return self._runtime.handle_tool_call(tool_name, args, **kwargs)
