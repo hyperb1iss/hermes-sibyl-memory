@@ -19,7 +19,7 @@ from typing import TypeAlias
 
 JsonValue: TypeAlias = None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 DEFAULT_LEASE_SECONDS = 30.0
 DEFAULT_PAGE_SIZE = 64
@@ -103,6 +103,17 @@ class NewOperation:
     idempotency_key: str
     depends_on_operation_id: str | None = None
     http_method: str = "POST"
+
+
+@dataclass(frozen=True, slots=True)
+class IndexedTurnRecord:
+    session_id: str
+    local_sequence: int
+    operation_id: str
+    source_id: str
+    turn_hash: str
+    revision: int | None
+    queued: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +311,8 @@ class DurableOutbox:
                 )
             if current_version == 0:
                 self._create_schema(connection)
+            elif current_version == 1:
+                self._migrate_session_index(connection)
             elif current_version != SCHEMA_VERSION:
                 raise OutboxError(f"no migration from outbox schema {current_version}")
         finally:
@@ -359,7 +372,61 @@ class DurableOutbox:
             );
             CREATE INDEX operation_history_outcome
                 ON operation_history(outcome, completed_at);
-            PRAGMA user_version = 1;
+
+            CREATE TABLE session_state (
+                session_id TEXT PRIMARY KEY,
+                parent_session_id TEXT NOT NULL DEFAULT '',
+                next_sequence INTEGER NOT NULL DEFAULT 1,
+                reconcile_required INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                CHECK (next_sequence >= 1),
+                CHECK (reconcile_required IN (0, 1))
+            );
+            CREATE TABLE session_turns (
+                session_id TEXT NOT NULL,
+                local_sequence INTEGER NOT NULL,
+                operation_id TEXT NOT NULL UNIQUE,
+                source_id TEXT NOT NULL UNIQUE,
+                turn_hash TEXT NOT NULL,
+                revision INTEGER,
+                PRIMARY KEY (session_id, local_sequence),
+                FOREIGN KEY (session_id) REFERENCES session_state(session_id),
+                CHECK (local_sequence >= 1),
+                CHECK (revision IS NULL OR revision >= 1)
+            );
+            CREATE INDEX session_turns_hash ON session_turns(session_id, turn_hash);
+            PRAGMA user_version = 2;
+            COMMIT;
+            """
+        )
+
+    def _migrate_session_index(self, connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """
+            BEGIN IMMEDIATE;
+            CREATE TABLE session_state (
+                session_id TEXT PRIMARY KEY,
+                parent_session_id TEXT NOT NULL DEFAULT '',
+                next_sequence INTEGER NOT NULL DEFAULT 1,
+                reconcile_required INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL,
+                CHECK (next_sequence >= 1),
+                CHECK (reconcile_required IN (0, 1))
+            );
+            CREATE TABLE session_turns (
+                session_id TEXT NOT NULL,
+                local_sequence INTEGER NOT NULL,
+                operation_id TEXT NOT NULL UNIQUE,
+                source_id TEXT NOT NULL UNIQUE,
+                turn_hash TEXT NOT NULL,
+                revision INTEGER,
+                PRIMARY KEY (session_id, local_sequence),
+                FOREIGN KEY (session_id) REFERENCES session_state(session_id),
+                CHECK (local_sequence >= 1),
+                CHECK (revision IS NULL OR revision >= 1)
+            );
+            CREATE INDEX session_turns_hash ON session_turns(session_id, turn_hash);
+            PRAGMA user_version = 2;
             COMMIT;
             """
         )
@@ -418,6 +485,166 @@ class DurableOutbox:
             connection.commit()
         self._secure_files()
         return True
+
+    def reserve_sequence(self, session_id: str, *, parent_session_id: str = "") -> int:
+        if not session_id:
+            raise ValueError("session_id is required")
+        now = _timestamp()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO session_state (
+                    session_id, parent_session_id, next_sequence,
+                    reconcile_required, updated_at
+                ) VALUES (?, ?, 1, 1, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    parent_session_id = CASE
+                        WHEN excluded.parent_session_id != ''
+                        THEN excluded.parent_session_id
+                        ELSE session_state.parent_session_id
+                    END,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, parent_session_id, now),
+            )
+            sequence = int(
+                connection.execute(
+                    "SELECT next_sequence FROM session_state WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()[0]
+            )
+            connection.execute(
+                "UPDATE session_state SET next_sequence = ?, updated_at = ? WHERE session_id = ?",
+                (sequence + 1, now, session_id),
+            )
+            connection.commit()
+        return sequence
+
+    def index_turn(
+        self,
+        *,
+        session_id: str,
+        local_sequence: int,
+        operation_id: str,
+        source_id: str,
+        turn_hash: str,
+    ) -> bool:
+        if not all((session_id, operation_id, source_id, turn_hash)) or local_sequence < 1:
+            raise ValueError("indexed turn fields are required")
+        now = _timestamp()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO session_state (
+                    session_id, next_sequence, reconcile_required, updated_at
+                ) VALUES (?, ?, 1, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    next_sequence = MAX(session_state.next_sequence, excluded.next_sequence),
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, local_sequence + 1, now),
+            )
+            existing = connection.execute(
+                """
+                SELECT operation_id, source_id, turn_hash
+                FROM session_turns
+                WHERE session_id = ? AND local_sequence = ?
+                """,
+                (session_id, local_sequence),
+            ).fetchone()
+            if existing is not None:
+                actual = (existing["operation_id"], existing["source_id"], existing["turn_hash"])
+                expected = (operation_id, source_id, turn_hash)
+                if actual != expected:
+                    connection.rollback()
+                    raise OperationConflictError(
+                        f"session {session_id} sequence {local_sequence} already identifies another turn"
+                    )
+                connection.commit()
+                return False
+            connection.execute(
+                """
+                INSERT INTO session_turns (
+                    session_id, local_sequence, operation_id, source_id, turn_hash
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, local_sequence, operation_id, source_id, turn_hash),
+            )
+            connection.commit()
+        return True
+
+    def mark_session_reconcile(
+        self,
+        session_id: str,
+        *,
+        parent_session_id: str = "",
+        required: bool = True,
+    ) -> None:
+        if not session_id:
+            raise ValueError("session_id is required")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO session_state (
+                    session_id, parent_session_id, reconcile_required, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    parent_session_id = CASE
+                        WHEN excluded.parent_session_id != ''
+                        THEN excluded.parent_session_id
+                        ELSE session_state.parent_session_id
+                    END,
+                    reconcile_required = excluded.reconcile_required,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, parent_session_id, int(required), _timestamp()),
+            )
+
+    def session_reconcile_required(self, session_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT reconcile_required FROM session_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return bool(row and row["reconcile_required"])
+
+    def indexed_turns(self, session_id: str) -> list[IndexedTurnRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT turn.*, EXISTS (
+                    SELECT 1 FROM operations AS operation
+                    WHERE operation.operation_id = turn.operation_id
+                ) AS queued
+                FROM session_turns AS turn
+                WHERE turn.session_id = ?
+                ORDER BY turn.local_sequence
+                """,
+                (session_id,),
+            ).fetchall()
+        return [
+            IndexedTurnRecord(
+                session_id=row["session_id"],
+                local_sequence=int(row["local_sequence"]),
+                operation_id=row["operation_id"],
+                source_id=row["source_id"],
+                turn_hash=row["turn_hash"],
+                revision=int(row["revision"]) if row["revision"] is not None else None,
+                queued=bool(row["queued"]),
+            )
+            for row in rows
+        ]
+
+    def record_turn_revision(self, operation_id: str, revision: int) -> None:
+        if revision < 1:
+            raise ValueError("revision must be positive")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE session_turns SET revision = ? WHERE operation_id = ?",
+                (revision, operation_id),
+            )
 
     def _validate_operation(self, operation: NewOperation) -> None:
         if not operation.operation_id or not operation.idempotency_key:
@@ -903,6 +1130,7 @@ __all__ = [
     "ClaimedOperation",
     "DurableOutbox",
     "FlushReport",
+    "IndexedTurnRecord",
     "NewOperation",
     "OperationConflictError",
     "OperationState",

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from outbox import (
+    SCHEMA_VERSION,
     AttemptResult,
     ClaimLostError,
     DurableOutbox,
@@ -50,7 +51,7 @@ def test_initializes_secure_wal_database_under_hermes_home(tmp_path: Path) -> No
     assert outbox.path.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(outbox.path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
 
 
 def test_enqueue_is_idempotent_but_rejects_operation_identity_reuse(tmp_path: Path) -> None:
@@ -328,3 +329,56 @@ def test_shutdown_flush_is_bounded_between_attempts_and_reports_remaining(tmp_pa
     assert report.claimed in {0, 1}
     assert report.remaining.total == 3 - report.claimed
     assert os.path.exists(outbox.path)
+
+
+def test_session_sequences_and_turn_index_survive_reopen(tmp_path: Path) -> None:
+    outbox = DurableOutbox(tmp_path)
+    assert outbox.reserve_sequence("session-1", parent_session_id="parent-1") == 1
+    assert outbox.reserve_sequence("session-1") == 2
+    assert outbox.index_turn(
+        session_id="session-1",
+        local_sequence=1,
+        operation_id="operation-1",
+        source_id="source-1",
+        turn_hash="hash-1",
+    )
+    outbox.close()
+
+    reopened = DurableOutbox(tmp_path)
+    indexed = reopened.indexed_turns("session-1")
+
+    assert indexed[0].operation_id == "operation-1"
+    assert indexed[0].local_sequence == 1
+    assert reopened.reserve_sequence("session-1") == 3
+    assert reopened.session_reconcile_required("session-1") is True
+
+
+def test_turn_index_reports_queued_state_and_revision(tmp_path: Path) -> None:
+    outbox = DurableOutbox(tmp_path)
+    queued = operation("operation-1")
+    outbox.enqueue(queued)
+    outbox.index_turn(
+        session_id="session-1",
+        local_sequence=1,
+        operation_id=queued.operation_id,
+        source_id="source-1",
+        turn_hash="hash-1",
+    )
+
+    assert outbox.indexed_turns("session-1")[0].queued is True
+    outbox.record_turn_revision("operation-1", 4)
+    claimed = outbox.claim_page("worker-1")[0]
+    outbox.apply_result(claimed, AttemptResult.success(status=200))
+
+    indexed = outbox.indexed_turns("session-1")[0]
+    assert indexed.queued is False
+    assert indexed.revision == 4
+
+
+def test_session_reconcile_flag_is_durable(tmp_path: Path) -> None:
+    outbox = DurableOutbox(tmp_path)
+    outbox.mark_session_reconcile("session-1", required=True)
+    assert outbox.session_reconcile_required("session-1") is True
+
+    outbox.mark_session_reconcile("session-1", required=False)
+    assert outbox.session_reconcile_required("session-1") is False
