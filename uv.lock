@@ -331,6 +331,7 @@ dev = [
     { name = "pyyaml" },
     { name = "ruff" },
     { name = "ty" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -343,6 +344,7 @@ dev = [
     { name = "pyyaml", specifier = "==6.0.3" },
     { name = "ruff", specifier = "==0.15.12" },
     { name = "ty", specifier = "==0.0.34" },
+    { name = "websockets", specifier = "==15.0.1" },
 ]
 
 [[package]]

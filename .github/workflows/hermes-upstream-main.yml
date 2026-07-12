@@ -1,0 +1,37 @@
+name: Hermes upstream main tracker
+
+on:
+  schedule:
+    - cron: "17 11 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upstream-main-contract:
+    name: Allowed-failure Hermes main contract
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - name: Test current Hermes main in an isolated environment
+        run: >-
+          uv run --isolated
+          --with pytest==9.0.2
+          --with pyyaml==6.0.3
+          --with httpx==0.28.1
+          --with 'hermes-agent @ git+https://github.com/NousResearch/hermes-agent.git@main'
+          env HERMES_SIBYL_UPSTREAM_CONTRACT=1
+          pytest -q tests/e2e/test_hermes_upstream_contract.py
+          --junitxml=hermes-upstream-main.xml
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hermes-upstream-main-contract
+          path: hermes-upstream-main.xml
+          if-no-files-found: warn

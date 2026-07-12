@@ -1,0 +1,59 @@
+name: Real-stack release gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: Comma-separated scenario slugs to execute
+        required: true
+        type: string
+      mutation_scenarios:
+        description: Comma-separated mutating scenario slugs explicitly authorized
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  real-stack:
+    name: Five real-stack release gates
+    runs-on: ubuntu-latest
+    environment: memory-provider-release-gates
+    env:
+      HERMES_SIBYL_E2E_HERMES_URL: ${{ secrets.HERMES_SIBYL_E2E_HERMES_URL }}
+      HERMES_SIBYL_E2E_SIBYL_URL: ${{ secrets.HERMES_SIBYL_E2E_SIBYL_URL }}
+      HERMES_SIBYL_E2E_PROFILE: ${{ secrets.HERMES_SIBYL_E2E_PROFILE }}
+      HERMES_SIBYL_E2E_API_KEY: ${{ secrets.HERMES_SIBYL_E2E_API_KEY }}
+      HERMES_SIBYL_E2E_HERMES_SESSION_TOKEN: ${{ secrets.HERMES_SIBYL_E2E_HERMES_SESSION_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --locked --all-groups
+      - name: Run explicitly authorized scenarios
+        env:
+          SELECTED_SCENARIOS: ${{ inputs.scenarios }}
+          MUTATION_SCENARIOS: ${{ inputs.mutation_scenarios }}
+        run: |
+          scenario_args=()
+          mutation_args=()
+          IFS=',' read -ra scenarios <<< "$SELECTED_SCENARIOS"
+          IFS=',' read -ra mutations <<< "$MUTATION_SCENARIOS"
+          for scenario in "${scenarios[@]}"; do
+            scenario_args+=(--scenario "${scenario//[[:space:]]/}")
+          done
+          for scenario in "${mutations[@]}"; do
+            mutation_args+=(--allow-mutation "${scenario//[[:space:]]/}")
+          done
+          uv run python scripts/release_gates.py run --real-stack \
+            "${scenario_args[@]}" "${mutation_args[@]}" \
+            --output release-gates.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: hermes-sibyl-release-gates
+          path: release-gates.json
+          if-no-files-found: error
